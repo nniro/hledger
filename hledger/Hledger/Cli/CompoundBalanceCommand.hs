@@ -12,12 +12,14 @@ module Hledger.Cli.CompoundBalanceCommand (
  ,compoundBalanceCommand
 ) where
 
+import Data.Time
 import Data.List (intercalate, foldl')
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Sum(..), (<>))
 import System.Console.CmdArgs.Explicit as C
+import qualified Data.Text as T
 import Text.CSV
-import Text.Tabular as T
+import Text.Tabular as TAB
 
 import Hledger
 import Hledger.Cli.Balance
@@ -114,6 +116,13 @@ compoundBalanceCommand CompoundBalanceCommandSpec{..} opts@CliOpts{command_=cmd,
       userq = queryFromOpts d ropts'
       format = outputFormatFromOpts opts
 
+    -- closing the expense accounts
+    let expTxns = closeAccounts d (And [userq, Acct "^expense"]) j "Closing expense account for consolidation" "equity:virtual:net worth"
+    let j' = foldl addTransactionCustom j expTxns
+    -- closing the income accounts
+    let incTxns = closeAccounts d (And [userq, Acct "^income"]) j' "Closing income account for consolidation" "equity:virtual:net worth"
+    let j2 = foldl addTransactionCustom j' incTxns
+
     case interval_ ropts' of
 
       -- single-column report
@@ -122,7 +131,7 @@ compoundBalanceCommand CompoundBalanceCommandSpec{..} opts@CliOpts{command_=cmd,
         let
           -- concatenate the rendering and sum the totals from each subreport
           (subreportstr, total) = 
-            foldMap (uncurry (compoundBalanceCommandSingleColumnReport ropts' userq j)) cbcqueries
+            foldMap (uncurry (compoundBalanceCommandSingleColumnReport ropts' userq j2)) cbcqueries
 
         writeOutput opts $ unlines $
           [title ++ "\n"] ++
@@ -145,7 +154,7 @@ compoundBalanceCommand CompoundBalanceCommandSpec{..} opts@CliOpts{command_=cmd,
           -- make a CompoundBalanceReport
           namedsubreports = 
             map (\(subreporttitle, subreportq) -> 
-                  (subreporttitle, compoundBalanceSubreport ropts' userq j subreportq)) 
+                  (subreporttitle, compoundBalanceSubreport ropts' userq j2 subreportq))
                 cbcqueries
           subtotalrows = [coltotals | MultiBalanceReport (_,_,(coltotals,_,_)) <- map snd namedsubreports]
           overalltotals = case subtotalrows of
@@ -174,11 +183,35 @@ compoundBalanceCommand CompoundBalanceCommandSpec{..} opts@CliOpts{command_=cmd,
           case format of
             "csv" -> printCSV (compoundBalanceReportAsCsv ropts cbr) ++ "\n"
             _     -> compoundBalanceReportAsText ropts' cbr
+  where
+    newTransaction :: Journal -> Day -> T.Text -> [Posting] -> Transaction
+    newTransaction j date description postings = txnTieKnot $ Transaction 0 nullsourcepos date Nothing Unmarked T.empty description T.empty [] postings T.empty
+
+    -- we expect a string like this : "9999 - some description" (including the double quotes)
+    -- the result will be 9999
+    getAcctCode :: AccountName -> AccountName
+    --getAcctCode = regexReplace "\(\"\|\)\([0-9]*\) .*" "\\2"
+    getAcctCode = T.pack . regexReplace "^\"*([0-9]*) .*" "\\1" . T.unpack
+
+    closeAccounts :: Day -> Query -> Journal -> T.Text -> T.Text -> [Transaction]
+    closeAccounts day qryToClose j description specialConsolAccountName = 
+      let ledger = ledgerFromJournal qryToClose j in map (closeAccount day) $ ledgerTopAccounts ledger
+      where	
+        closeAccount day acct =
+          let
+            amount = sum $ amounts $ aibalance acct
+            credit = post specialConsolAccountName amount
+            debit = post (getAcctCode (aname acct)) (divideAmount amount (-1))
+          in
+          newTransaction j day description [debit, credit]
+      
+    addTransactionCustom :: Journal -> Transaction -> Journal
+    addTransactionCustom jo t = jo {jtxns = jtxns jo ++ [t]}
 
 -- | Render a multi-column balance report as plain text suitable for console output.
 -- Add the second table below the first, discarding its column headings.
 concatTables (Table hLeft hTop dat) (Table hLeft' _ dat') =
-    Table (T.Group DoubleLine [hLeft, hLeft']) hTop (dat ++ dat')
+    Table (TAB.Group DoubleLine [hLeft, hLeft']) hTop (dat ++ dat')
 
 -- | Run one subreport for a compound balance command in single-column mode.
 -- Currently this returns the plain text rendering of the subreport, and its total.
@@ -264,7 +297,7 @@ compoundBalanceReportAsText ropts (title, subreports, (coltotals, grandtotal, gr
     singlesubreport = length subreports == 1
     bigtable = 
       case map (subreportAsTable ropts singlesubreport) subreports of
-        []   -> T.empty
+        []   -> TAB.empty
         r:rs -> foldl' concatTables r rs
     bigtable'
       | no_total_ ropts || singlesubreport = 
@@ -288,7 +321,7 @@ compoundBalanceReportAsText ropts (title, subreports, (coltotals, grandtotal, gr
         -- convert to table
         Table lefthdrs tophdrs cells = balanceReportAsTable ropts' r
         -- tweak the layout
-        t = Table (T.Group SingleLine [Header title, lefthdrs]) tophdrs ([]:cells)
+        t = Table (TAB.Group SingleLine [Header title, lefthdrs]) tophdrs ([]:cells)
 
 -- | Render a compound balance report as CSV.
 {- Eg: 
